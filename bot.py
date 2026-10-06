@@ -1,5 +1,5 @@
 """
-Телеграм-бот "Магазин овощей и фруктов"
+Телеграм-бот "СвойМаркет" — свежие продукты с доставкой
 =========================================
 
 Функции:
@@ -155,7 +155,8 @@ router = Router()
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "Добро пожаловать в магазин свежих овощей и фруктов! 🥒🍅🥭\n\n"
+        "Добро пожаловать в СвойМаркет! 🥒🍅🥭\n"
+        "Свежие продукты высокого качества — с доставкой на дом.\n\n"
         "Выберите товар, чтобы добавить его в корзину:",
         reply_markup=catalog_keyboard(),
     )
@@ -262,7 +263,7 @@ async def process_address(message: Message, state: FSMContext):
             "amount": {"value": f"{total}.00", "currency": "RUB"},
             "confirmation": {
                 "type": "redirect",
-                "return_url": "https://t.me/mandarin_dolka_bot",
+                "return_url": "https://t.me/YOUR_BOT_USERNAME",
             },
             "capture": True,
             "description": f"Заказ овощей/фруктов на сумму {total}₽",
