@@ -1,17 +1,3 @@
-"""
-Телеграм-бот "СвойМаркет" — свежие продукты с доставкой
-=========================================
-
-Функции:
-- Каталог товаров (из products.json)
-- Корзина (добавление/удаление товаров)
-- Оформление заказа (адрес доставки)
-- Оплата через ЮKassa (YooKassa)
-- Проверка статуса оплаты
-
-Как запустить — см. README.md
-"""
-
 import json
 import logging
 import os
@@ -28,16 +14,14 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InputMediaPhoto,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from yookassa import Configuration, Payment
 
-# ---------------------------------------------------------------------------
-# КОНФИГУРАЦИЯ (заполняется через переменные окружения — см. .env.example)
-# ---------------------------------------------------------------------------
-
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "")
 YOOKASSA_SHOP_ID = os.environ.get("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.environ.get("YOOKASSA_SECRET_KEY", "")
 
@@ -54,21 +38,13 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# КАТАЛОГ ТОВАРОВ
-# ---------------------------------------------------------------------------
-
 with open(os.path.join(os.path.dirname(__file__), "products.json"), encoding="utf-8") as f:
     PRODUCTS = {p["id"]: p for p in json.load(f)}
 
 
-# ---------------------------------------------------------------------------
-# ХРАНИЛИЩЕ КОРЗИН (в памяти; для продакшена лучше заменить на базу данных)
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Cart:
-    items: dict = field(default_factory=dict)  # product_id -> количество
+    items: dict = field(default_factory=dict)
 
     def add(self, product_id: str, qty: int = 1):
         self.items[product_id] = self.items.get(product_id, 0) + qty
@@ -89,9 +65,7 @@ class Cart:
         self.items.clear()
 
 
-# user_id -> Cart
 CARTS: dict[int, Cart] = {}
-# payment_id -> user_id, для сопоставления оплаты с заказом
 PENDING_PAYMENTS: dict[str, int] = {}
 
 
@@ -101,17 +75,9 @@ def get_cart(user_id: int) -> Cart:
     return CARTS[user_id]
 
 
-# ---------------------------------------------------------------------------
-# СОСТОЯНИЯ (для сбора адреса доставки)
-# ---------------------------------------------------------------------------
-
 class OrderStates(StatesGroup):
     waiting_for_address = State()
 
-
-# ---------------------------------------------------------------------------
-# КЛАВИАТУРЫ
-# ---------------------------------------------------------------------------
 
 def catalog_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -129,9 +95,9 @@ def cart_keyboard(cart: Cart) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for pid, qty in cart.items.items():
         p = PRODUCTS[pid]
-        builder.button(text=f"➖", callback_data=f"remove:{pid}")
+        builder.button(text="➖", callback_data=f"remove:{pid}")
         builder.button(text=f"{p['emoji']} {p['name']} x{qty}", callback_data="noop")
-        builder.button(text=f"➕", callback_data=f"add:{pid}")
+        builder.button(text="➕", callback_data=f"add:{pid}")
     builder.adjust(3)
     if not cart.is_empty():
         builder.row(InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout"))
@@ -145,18 +111,55 @@ def payment_check_keyboard(payment_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ---------------------------------------------------------------------------
-# ХЕНДЛЕРЫ
-# ---------------------------------------------------------------------------
-
 router = Router()
+
+
+async def send_product_photos(message: Message):
+    photo_products = [p for p in PRODUCTS.values() if p.get("photo_url")]
+    if not photo_products:
+        return
+    media = []
+    for p in photo_products[:10]:
+        caption = f"{p['emoji']} {p['name']} — {p['price']}₽/{p['unit']}"
+        media.append(InputMediaPhoto(media=p["photo_url"], caption=caption))
+    try:
+        await message.answer_media_group(media=media)
+    except Exception as e:
+        logger.warning("Не удалось отправить фото товаров: %s", e)
+
+
+async def notify_owner_new_order(bot: Bot, buyer, cart: "Cart", address: str, total: int, paid: bool):
+    if not OWNER_CHAT_ID:
+        return
+    name = buyer.full_name or "Без имени"
+    username = f"@{buyer.username}" if buyer.username else "нет username"
+    items = "\n".join(
+        f"{PRODUCTS[pid]['emoji']} {PRODUCTS[pid]['name']} x{qty}"
+        for pid, qty in cart.items.items()
+    )
+    status = "оплачено" if paid else "оплата наличными при получении"
+    text = (
+        "🔔 НОВЫЙ ЗАКАЗ\n\n"
+        f"Покупатель: {name} ({username})\n\n"
+        f"{items}\n\n"
+        f"Сумма: {total}₽\n"
+        f"Адрес: {address}\n"
+        f"Оплата: {status}"
+    )
+    try:
+        await bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
+    except Exception as e:
+        logger.warning("Не удалось уведомить владельца: %s", e)
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "Добро пожаловать в СвойМаркет! 🥒🍅🥭\n"
-        "Свежие продукты высокого качества — с доставкой на дом.\n\n"
+        "Добро пожаловать в СвойМаркет! 🥒🍅🥭\n\n"
+        "Свежие продукты высокого качества — с доставкой на дом."
+    )
+    await send_product_photos(message)
+    await message.answer(
         "Выберите товар, чтобы добавить его в корзину:",
         reply_markup=catalog_keyboard(),
     )
@@ -228,14 +231,15 @@ async def start_checkout(callback: CallbackQuery, state: FSMContext):
         return
     await callback.message.answer(
         "Укажите, пожалуйста, адрес доставки одним сообщением\n"
-        "(город, улица, дом, квартира):"
+        "(улица, дом, подъезд, квартира).\n\n"
+        "Если у вас есть промокод с брошюры, напишите его вместе с адресом:"
     )
     await state.set_state(OrderStates.waiting_for_address)
     await callback.answer()
 
 
 @router.message(OrderStates.waiting_for_address)
-async def process_address(message: Message, state: FSMContext):
+async def process_address(message: Message, state: FSMContext, bot: Bot):
     address = message.text
     cart = get_cart(message.from_user.id)
     total = cart.total()
@@ -246,13 +250,14 @@ async def process_address(message: Message, state: FSMContext):
             for pid, qty in cart.items.items()
         )
         await message.answer(
-            f"✅ Заказ оформлен (демо-режим, оплата не подключена)!\n\n"
+            f"✅ Заказ принят!\n\n"
             f"{order_summary}\n\n"
             f"Сумма: {total}₽\n"
             f"Адрес доставки: {address}\n\n"
-            f"Чтобы включить приём реальных платежей — заполните "
-            f"YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY в .env"
+            f"Оплата — наличными при получении.\n"
+            f"Мы свяжемся с вами для уточнения времени доставки."
         )
+        await notify_owner_new_order(bot, message.from_user, cart, address, total, paid=False)
         cart.clear()
         await state.clear()
         return
@@ -263,10 +268,10 @@ async def process_address(message: Message, state: FSMContext):
             "amount": {"value": f"{total}.00", "currency": "RUB"},
             "confirmation": {
                 "type": "redirect",
-                "return_url": "https://t.me/YOUR_BOT_USERNAME",
+                "return_url": "https://t.me/svoy_market_bot",
             },
             "capture": True,
-            "description": f"Заказ овощей/фруктов на сумму {total}₽",
+            "description": f"Заказ на сумму {total}₽",
             "metadata": {"telegram_user_id": message.from_user.id, "address": address},
         },
         idempotence_key,
@@ -285,7 +290,7 @@ async def process_address(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("check:"))
-async def check_payment(callback: CallbackQuery):
+async def check_payment(callback: CallbackQuery, bot: Bot):
     payment_id = callback.data.split(":", 1)[1]
     payment = Payment.find_one(payment_id)
 
@@ -303,16 +308,12 @@ async def check_payment(callback: CallbackQuery):
         await callback.answer(f"Статус платежа: {payment.status}", show_alert=True)
 
 
-# ---------------------------------------------------------------------------
-# ЗАПУСК БОТА
-# ---------------------------------------------------------------------------
-
 async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Бот запущен. Оплата через ЮKassa: %s", "включена" if PAYMENTS_ENABLED else "выключена (демо-режим)")
+    logger.info("Бот запущен. Оплата через ЮKassa: %s", "включена" if PAYMENTS_ENABLED else "выключена (оплата наличными)")
 
     await dp.start_polling(bot)
 
